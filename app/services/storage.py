@@ -1,8 +1,15 @@
 import os
 import sqlite3
+import json
 from typing import List, Dict, Optional
 from flask import Flask
 from ..models.paper import Paper
+try:
+    import pymysql
+    from pymysql.cursors import DictCursor
+except Exception:  # optional until mysql is used
+    pymysql = None
+    DictCursor = None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS papers (
@@ -99,8 +106,131 @@ class SQLiteStorage:
         return {"items": items, "count": len(items), "offset": offset, "limit": limit}
 
 
-def get_storage(app: Flask) -> SQLiteStorage:
-    backend = app.config.get("STORAGE_BACKEND", "sqlite")
-    if backend != "sqlite":
-        raise NotImplementedError("Only sqlite backend implemented for now")
+class MySQLStorage:
+    def __init__(self, host: str, port: int, user: str, password: str, database: str):
+        if pymysql is None:
+            raise RuntimeError("PyMySQL is required for MySQL backend. Please install PyMySQL.")
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.database = database
+        self._init_db()
+
+    def _connect(self):
+        return pymysql.connect(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=self.password,
+            database=self.database,
+            autocommit=False,
+            cursorclass=DictCursor,
+            charset="utf8mb4",
+        )
+
+    def _init_db(self):
+        conn = self._connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS papers (
+                      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                      title VARCHAR(1024) NOT NULL,
+                      url VARCHAR(2048) NOT NULL,
+                      doi VARCHAR(255) NULL,
+                      source VARCHAR(64) NOT NULL,
+                      published_at DATETIME NULL,
+                      authors TEXT NULL,
+                      abstract MEDIUMTEXT NULL,
+                      journal VARCHAR(255) NULL,
+                      extras TEXT NULL,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      UNIQUE KEY uniq_url (url),
+                      INDEX idx_source_published (source, published_at),
+                      INDEX idx_title (title(255))
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    """
+                )
+        conn.close()
+
+    def upsert_papers(self, papers: List[Paper]) -> int:
+        if not papers:
+            return 0
+        conn = self._connect()
+        with conn:
+            with conn.cursor() as cur:
+                sql = (
+                    """
+                    INSERT INTO papers
+                      (title, url, doi, source, published_at, authors, abstract, journal, extras)
+                    VALUES
+                      (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                      title=VALUES(title),
+                      doi=VALUES(doi),
+                      source=VALUES(source),
+                      published_at=VALUES(published_at),
+                      authors=VALUES(authors),
+                      abstract=VALUES(abstract),
+                      journal=VALUES(journal),
+                      extras=VALUES(extras)
+                    """
+                )
+                for p in papers:
+                    cur.execute(
+                        sql,
+                        (
+                            p.title,
+                            p.url,
+                            p.doi,
+                            p.source,
+                            p.published_at.strftime("%Y-%m-%d %H:%M:%S") if p.published_at else None,
+                            ", ".join(p.authors) if p.authors else None,
+                            p.abstract,
+                            p.journal,
+                            json.dumps(p.extras) if p.extras else None,
+                        ),
+                    )
+            conn.commit()
+        conn.close()
+        return len(papers)
+
+    def search_papers(self, query: str = "", source: Optional[str] = None, limit: int = 50, offset: int = 0) -> Dict:
+        conn = self._connect()
+        items: List[Dict] = []
+        with conn:
+            with conn.cursor() as cur:
+                sql = "SELECT * FROM papers WHERE 1=1"
+                params: List = []
+                if query:
+                    sql += " AND (title LIKE %s OR abstract LIKE %s OR authors LIKE %s)"
+                    like = f"%{query}%"
+                    params.extend([like, like, like])
+                if source:
+                    sql += " AND source = %s"
+                    params.append(source)
+                # Push NULLs to end for published_at: (published_at IS NULL) asc then published_at desc
+                sql += " ORDER BY (published_at IS NULL), published_at DESC, id DESC LIMIT %s OFFSET %s"
+                params.extend([int(limit), int(offset)])
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                for r in rows:
+                    items.append(r)
+        conn.close()
+        return {"items": items, "count": len(items), "offset": offset, "limit": limit}
+
+
+def get_storage(app: Flask):
+    backend = (app.config.get("STORAGE_BACKEND") or "sqlite").lower()
+    if backend == "mysql":
+        return MySQLStorage(
+            host=app.config.get("MYSQL_HOST", "127.0.0.1"),
+            port=int(app.config.get("MYSQL_PORT", 3306)),
+            user=app.config.get("MYSQL_USER", "root"),
+            password=app.config.get("MYSQL_PASSWORD", ""),
+            database=app.config.get("MYSQL_DB", "test"),
+        )
+    # default to sqlite for local/dev
     return SQLiteStorage(app.config.get("SQLITE_PATH", "/data/papers.db"))
