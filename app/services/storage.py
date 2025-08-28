@@ -44,68 +44,6 @@ def init_db(path: str):
     conn.close()
 
 
-class SQLiteStorage:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        init_db(db_path)
-
-    def upsert_papers(self, papers: List[Paper]) -> int:
-        if not papers:
-            return 0
-        conn = get_db(self.db_path)
-        with conn:
-            for p in papers:
-                conn.execute(
-                    """
-                    INSERT INTO papers(title, url, doi, source, published_at, authors, abstract, journal, extras)
-                    VALUES(?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(url) DO UPDATE SET
-                        title=excluded.title,
-                        doi=excluded.doi,
-                        source=excluded.source,
-                        published_at=excluded.published_at,
-                        authors=excluded.authors,
-                        abstract=excluded.abstract,
-                        journal=excluded.journal,
-                        extras=excluded.extras
-                    """,
-                    (
-                        p.title,
-                        p.url,
-                        p.doi,
-                        p.source,
-                        p.published_at.isoformat() if p.published_at else None,
-                        ", ".join(p.authors) if p.authors else None,
-                        p.abstract,
-                        p.journal,
-                        str(p.extras) if p.extras else None,
-                    ),
-                )
-        conn.close()
-        return len(papers)
-
-    def search_papers(self, query: str = "", source: Optional[str] = None, limit: int = 50, offset: int = 0) -> Dict:
-        conn = get_db(self.db_path)
-        sql = "SELECT * FROM papers WHERE 1=1"
-        params: List = []
-        if query:
-            sql += " AND (title LIKE ? OR abstract LIKE ? OR authors LIKE ?)"
-            like = f"%{query}%"
-            params.extend([like, like, like])
-        if source:
-            sql += " AND source = ?"
-            params.append(source)
-        # SQLite doesn't support NULLS LAST; use COALESCE to push NULLs to the end
-        sql += " ORDER BY COALESCE(published_at, '' ) DESC, id DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-        rows = conn.execute(sql, params).fetchall()
-        conn.close()
-        items = []
-        for r in rows:
-            items.append({k: r[k] for k in r.keys()})
-        return {"items": items, "count": len(items), "offset": offset, "limit": limit}
-
-
 class MySQLStorage:
     def __init__(self, host: str, port: int, user: str, password: str, database: str):
         if pymysql is None:
@@ -139,6 +77,7 @@ class MySQLStorage:
                       id BIGINT AUTO_INCREMENT PRIMARY KEY,
                       title VARCHAR(1024) NOT NULL,
                       url VARCHAR(2048) NOT NULL,
+                      url_hash CHAR(64) GENERATED ALWAYS AS (sha2(url,256)) STORED,
                       doi VARCHAR(255) NULL,
                       source VARCHAR(64) NOT NULL,
                       published_at DATETIME NULL,
@@ -147,13 +86,22 @@ class MySQLStorage:
                       journal VARCHAR(255) NULL,
                       extras TEXT NULL,
                       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                      UNIQUE KEY uniq_url (url),
+                      UNIQUE KEY uniq_url_hash (url_hash),
                       INDEX idx_source_published (source, published_at),
                       INDEX idx_title (title(255))
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
                     """
                 )
-        conn.close()
+                # Migration: ensure url_hash exists and is unique; drop old uniq_url if present
+                cur.execute("SHOW COLUMNS FROM papers LIKE 'url_hash'")
+                if not cur.fetchone():
+                    cur.execute("ALTER TABLE papers ADD COLUMN url_hash CHAR(64) AS (sha2(url,256)) STORED")
+                cur.execute("SHOW INDEX FROM papers WHERE Key_name='uniq_url'")
+                if cur.fetchone():
+                    cur.execute("ALTER TABLE papers DROP INDEX uniq_url")
+                cur.execute("SHOW INDEX FROM papers WHERE Key_name='uniq_url_hash'")
+                if not cur.fetchone():
+                    cur.execute("ALTER TABLE papers ADD UNIQUE KEY uniq_url_hash (url_hash)")
 
     def upsert_papers(self, papers: List[Paper]) -> int:
         if not papers:
@@ -194,7 +142,6 @@ class MySQLStorage:
                         ),
                     )
             conn.commit()
-        conn.close()
         return len(papers)
 
     def search_papers(self, query: str = "", source: Optional[str] = None, limit: int = 50, offset: int = 0) -> Dict:
@@ -211,14 +158,18 @@ class MySQLStorage:
                 if source:
                     sql += " AND source = %s"
                     params.append(source)
-                # Push NULLs to end for published_at: (published_at IS NULL) asc then published_at desc
                 sql += " ORDER BY (published_at IS NULL), published_at DESC, id DESC LIMIT %s OFFSET %s"
                 params.extend([int(limit), int(offset)])
                 cur.execute(sql, params)
                 rows = cur.fetchall()
                 for r in rows:
-                    items.append(r)
-        conn.close()
+                    if isinstance(r, dict):
+                        items.append(r)
+                    else:
+                        try:
+                            items.append(dict(r))
+                        except Exception:
+                            pass
         return {"items": items, "count": len(items), "offset": offset, "limit": limit}
 
 
@@ -234,3 +185,65 @@ def get_storage(app: Flask):
         )
     # default to sqlite for local/dev
     return SQLiteStorage(app.config.get("SQLITE_PATH", "/data/papers.db"))
+
+
+class SQLiteStorage:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        init_db(db_path)
+
+    def upsert_papers(self, papers: List[Paper]) -> int:
+        if not papers:
+            return 0
+        conn = get_db(self.db_path)
+        with conn:
+            for p in papers:
+                conn.execute(
+                    """
+                    INSERT INTO papers(title, url, doi, source, published_at, authors, abstract, journal, extras)
+                    VALUES(?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        title=excluded.title,
+                        doi=excluded.doi,
+                        source=excluded.source,
+                        published_at=excluded.published_at,
+                        authors=excluded.authors,
+                        abstract=excluded.abstract,
+                        journal=excluded.journal,
+                        extras=excluded.extras
+                    """,
+                    (
+                        p.title,
+                        p.url,
+                        p.doi,
+                        p.source,
+                        p.published_at.isoformat() if p.published_at else None,
+                        ", ".join(p.authors) if p.authors else None,
+                        p.abstract,
+                        p.journal,
+                        json.dumps(p.extras) if p.extras else None,
+                    ),
+                )
+        conn.close()
+        return len(papers)
+
+    def search_papers(self, query: str = "", source: Optional[str] = None, limit: int = 50, offset: int = 0) -> Dict:
+        conn = get_db(self.db_path)
+        sql = "SELECT * FROM papers WHERE 1=1"
+        params: List = []
+        if query:
+            sql += " AND (title LIKE ? OR abstract LIKE ? OR authors LIKE ?)"
+            like = f"%{query}%"
+            params.extend([like, like, like])
+        if source:
+            sql += " AND source = ?"
+            params.append(source)
+        # SQLite: push NULLs to end
+        sql += " ORDER BY COALESCE(published_at, '' ) DESC, id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+        items = []
+        for r in rows:
+            items.append({k: r[k] for k in r.keys()})
+        return {"items": items, "count": len(items), "offset": offset, "limit": limit}

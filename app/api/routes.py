@@ -23,8 +23,13 @@ def list_papers():
 @api_bp.post("/crawl/run")
 def trigger_crawl():
     scheduler = get_scheduler(current_app)
-    ran = scheduler.run_once()
-    return jsonify({"triggered": True, "items": ran})
+    sync = request.args.get("sync", "0") == "1"
+    if sync:
+        ran = scheduler.run_once()
+        return jsonify({"triggered": True, "items": ran, "mode": "sync"})
+    else:
+        started = scheduler.run_once_async()
+        return jsonify({"triggered": started, "mode": "async"})
 
 
 @api_bp.get("/crawl/status")

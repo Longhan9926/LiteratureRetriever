@@ -1,7 +1,8 @@
+import os
 import threading
 import time
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, cast
 from flask import Flask
 from ..services.storage import get_storage
 from ..crawler.nature import NatureCrawler
@@ -11,10 +12,15 @@ from ..crawler.nature_rss import NatureRSSCrawler
 class Scheduler:
     def __init__(self, app: Flask):
         self.app = app
-        self.thread = None
+        self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
-        self.last_run_at = None
-        self.last_result_count = 0
+        self.last_run_at: str | None = None
+        self.last_result_count: int = 0
+        # One-off job control
+        self._job_lock = threading.Lock()
+        self._job_running = False
+        # Snapshot interval to avoid accessing app context in background thread
+        self.interval = self._cron_to_interval_seconds(app.config.get("SCHEDULER_CRON", "*/30 * * * *"))
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -24,14 +30,18 @@ class Scheduler:
         self.thread.start()
 
     def _run_loop(self):
-        interval = self._cron_to_interval_seconds(self.app.config.get("SCHEDULER_CRON", "*/30 * * * *"))
         while not self.stop_event.is_set():
-            self.run_once()
+            try:
+                self.run_once()
+            except Exception:
+                # Avoid killing the loop on transient errors
+                pass
             # sleep with small steps to be responsive to stop
             slept = 0
-            while slept < interval and not self.stop_event.is_set():
-                time.sleep(min(5, interval - slept))
-                slept += min(5, interval - slept)
+            while slept < self.interval and not self.stop_event.is_set():
+                step = min(5, self.interval - slept)
+                time.sleep(step)
+                slept += step
 
     def _cron_to_interval_seconds(self, cron_expr: str) -> int:
         # For simplicity support formats like '*/N * * * *'
@@ -49,18 +59,16 @@ class Scheduler:
             ua = self.app.config.get("USER_AGENT")
             max_items = int(self.app.config.get("MAX_ITEMS_PER_RUN", 50))
             # Native Nature crawler
-            papers = []
+            papers: List = []
             try:
-                crawler = NatureCrawler(user_agent=ua)
-                papers.extend(crawler.fetch_latest(max_items=max_items))
+                papers.extend(NatureCrawler(user_agent=ua).fetch_search("solar cell molecule", max_items=max_items))
             except Exception:
                 pass
             # RSS crawlers for portfolio journals
             feeds = [f for f in (self.app.config.get("FEEDS") or []) if f]
             if feeds:
                 try:
-                    rss = NatureRSSCrawler(feeds=feeds, user_agent=ua)
-                    papers.extend(rss.fetch_latest(max_items=max_items))
+                    papers.extend(NatureRSSCrawler(feeds=feeds, user_agent=ua).fetch_latest(max_items=max_items))
                 except Exception:
                     pass
             count = storage.upsert_papers(papers)
@@ -68,17 +76,45 @@ class Scheduler:
             self.last_result_count = count
             return count
 
+    def run_once_async(self) -> bool:
+        """Start a single crawl run in a background thread.
+        Returns True if started, False if a job is already running.
+        """
+        # Prevent overlapping one-off jobs
+        with self._job_lock:
+            if self._job_running:
+                return False
+            self._job_running = True
+
+        def _job():
+            try:
+                self.run_once()
+            finally:
+                with self._job_lock:
+                    self._job_running = False
+
+        threading.Thread(target=_job, daemon=True).start()
+        return True
+
     def status(self) -> Dict:
         return {
             "last_run_at": self.last_run_at,
             "last_result_count": self.last_result_count,
             "running": self.thread.is_alive() if self.thread else False,
+            "job_running": self._job_running,
         }
 
 
 def get_scheduler(app: Flask) -> Scheduler:
-    # Singleton per app instance
-    if not hasattr(app, "_scheduler"):
-        app._scheduler = Scheduler(app)
-        app._scheduler.start()
-    return app._scheduler
+    # Unwrap LocalProxy if needed
+    real_app_getter = getattr(app, "_get_current_object", None)
+    if callable(real_app_getter):
+        app = cast(Flask, real_app_getter())
+    # Use Flask extensions registry to hold the scheduler instance
+    if not hasattr(app, "extensions") or app.extensions is None:
+        app.extensions = {}
+    if "literature_scheduler" not in app.extensions:
+        app.extensions["literature_scheduler"] = Scheduler(app)
+        if os.getenv("START_SCHEDULER", "1") == "1":
+            app.extensions["literature_scheduler"].start()
+    return cast(Scheduler, app.extensions["literature_scheduler"])

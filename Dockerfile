@@ -8,7 +8,7 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl ca-certificates && \
+    build-essential curl ca-certificates pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./

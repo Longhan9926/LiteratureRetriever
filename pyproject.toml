@@ -9,8 +9,9 @@ dependencies = [
     "flask==3.1.2",
     "gunicorn==22.0.0",
     "lxml==5.2.2",
-    "pymysql>=1.1.2",
     "requests==2.32.3",
+    "PyMySQL==1.1.1",
+    "cryptography==43.0.1",
 ]
 
 [[tool.uv.index]]

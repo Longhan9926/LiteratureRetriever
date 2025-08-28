@@ -3,4 +3,8 @@ gunicorn==22.0.0
 requests==2.32.3
 beautifulsoup4==4.12.3
 lxml==5.2.2
+PyMySQL==1.1.1
+cryptography==43.0.1
+pymysql>=1.1.2
+cryptography>=42
 pymysql>=1.1.2

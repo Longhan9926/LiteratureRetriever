@@ -17,8 +17,8 @@ def create_app():
         MYSQL_HOST=os.getenv("MYSQL_HOST", "10.7.2.207"),
         MYSQL_PORT=int(os.getenv("MYSQL_PORT", "30211")),
         MYSQL_DB=os.getenv("MYSQL_DB", "ai4pv"),
-        MYSQL_USER=os.getenv("MYSQL_USER", "root"),
-        MYSQL_PASSWORD=os.getenv("MYSQL_PASSWORD", ""),
+        MYSQL_USER=os.getenv("MYSQL_USER", "share"),
+        MYSQL_PASSWORD=os.getenv("MYSQL_PASSWORD", 'u7!Y#%V&A!N%7e'),
     )
 
     # Register blueprints

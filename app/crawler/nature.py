@@ -3,11 +3,13 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 import requests
 from bs4 import BeautifulSoup
+from bs4.element import Tag
 from ..models.paper import Paper
 
 
 BASE_URL = "https://www.nature.com"
 LATEST_URL = "https://www.nature.com/nature/research-articles"  # Research Articles
+SEARCH_URL = "https://www.nature.com/search"
 
 
 class NatureCrawler:
@@ -62,6 +64,56 @@ class NatureCrawler:
             ))
         return papers
 
+    def fetch_search(self, query: str, max_items: int = 50) -> List[Paper]:
+        params = {
+            "q": query,
+            "journal": "nature",
+            "article_type": "research",
+            "order": "date_desc",
+        }
+        r = self.session.get(SEARCH_URL, params=params, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        papers: List[Paper] = []
+        # Try card layout first
+        items = soup.select("article.c-card")
+        if not items:
+            # Fallback to older list layout
+            items = soup.select("li.app-article-list-row__item, li.mb20")
+        for el in items[:max_items]:
+            a_tag = el.select_one("h3 a, a.c-card__link") or el.find("a", href=True)
+            if not a_tag or not isinstance(a_tag, Tag):
+                continue
+            title = a_tag.get_text(strip=True)
+            href_val = a_tag.get("href")
+            href = href_val[0] if isinstance(href_val, list) and href_val else (href_val or "")
+            url = href if (isinstance(href, str) and href.startswith("http")) else f"{BASE_URL}{href}"
+            # Date (if available)
+            published_at = None
+            t = el.find("time")
+            if isinstance(t, Tag) and t.has_attr("datetime"):
+                try:
+                    dtv = t.get("datetime")
+                    if isinstance(dtv, str):
+                        published_at = datetime.fromisoformat(dtv.replace("Z", "+00:00"))
+                except Exception:
+                    published_at = None
+            # Authors (best effort)
+            authors = [a.get_text(strip=True) for a in el.select("ul.c-author-list li")] or None
+            abstract, doi = self._fetch_detail(url)
+            papers.append(Paper(
+                title=title,
+                url=url,
+                doi=doi,
+                source="nature",
+                published_at=published_at,
+                authors=authors,
+                abstract=abstract,
+                journal="Nature",
+                extras={"query": query},
+            ))
+        return papers
+
     def _fetch_detail(self, url: str) -> Tuple[Optional[str], Optional[str]]:
         try:
             r = self.session.get(url, timeout=20)
@@ -74,8 +126,8 @@ class NatureCrawler:
             doi = None
             doi_meta = soup.find("meta", attrs={"name": "dc.identifier"})
             content = None
-            if doi_meta is not None and hasattr(doi_meta, "attrs") and isinstance(doi_meta.attrs, dict):
-                content = doi_meta.attrs.get("content")
+            if isinstance(doi_meta, Tag):
+                content = doi_meta.get("content")
                 if isinstance(content, str) and content.startswith("doi:"):
                     doi = content[4:]
             return abstract, doi
